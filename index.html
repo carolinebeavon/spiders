@@ -39,45 +39,50 @@ html, body {
   transform: scaleX(-1); /* mirror the whole scene — feels like a mirror, not a mugshot */
 }
 
-#start-overlay {
+#loading-overlay {
   position: absolute;
   inset: 0;
   z-index: 10;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  padding: 12px;
-  background: rgba(0, 0, 0, 0.85);
+  gap: clamp(10px, 4cqw, 18px);
+  background: #000;
 }
 
-#start-overlay.hidden {
+#loading-overlay.hidden {
   display: none;
 }
 
-#start-btn {
-  font-family: inherit;
-  font-size: clamp(11px, 4cqw, 16px);
-  letter-spacing: 0.08em;
-  text-transform: lowercase;
-  padding: clamp(8px, 3cqw, 14px) clamp(14px, 5cqw, 28px);
-  background: #ff2a2a;
-  color: #000;
-  border: none;
-  cursor: pointer;
+#loading-spider {
+  position: absolute;
+  top: 45%;
+  left: -10%;
+  width: clamp(30px, 12cqw, 54px);
+  height: auto;
+  image-rendering: pixelated;
+  animation: spider-run 2.6s linear infinite;
 }
 
-#start-btn:hover {
-  background: #ff8a8a;
+@keyframes spider-run {
+  from { left: -10%; }
+  to { left: 110%; }
 }
 
-#start-overlay .hint {
-  color: #ff8a8a;
-  font-size: clamp(9px, 3cqw, 12px);
-  max-width: 90%;
-  text-align: center;
-  opacity: 0.85;
+#loading-text {
+  margin: 0;
+  color: #ff2a2a;
+  font-size: clamp(9px, 3.5cqw, 13px);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  animation: loading-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes loading-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
 }
 
 #hud {
@@ -128,13 +133,13 @@ html, body {
   <video id="raw-video" autoplay playsinline muted></video>
   <canvas id="scene"></canvas>
 
-  <div id="start-overlay">
-    <button id="start-btn">start sp1dr</button>
-    <p class="hint">grants camera access. spiders crawl in from the edges — open your mouth to swallow them.</p>
+  <div id="loading-overlay">
+    <canvas id="loading-spider" width="9" height="5"></canvas>
+    <p id="loading-text">spiders loading</p>
   </div>
 
   <div id="hud">
-    <span id="status-text">idle</span>
+    <span id="status-text">loading</span>
     <span id="spider-count">0 spiders</span>
   </div>
 
@@ -154,8 +159,10 @@ const rawVideo = document.getElementById("raw-video");
 const canvas = document.getElementById("scene");
 const ctx = canvas.getContext("2d");
 
-const startOverlay = document.getElementById("start-overlay");
-const startBtn = document.getElementById("start-btn");
+const loadingOverlay = document.getElementById("loading-overlay");
+const loadingText = document.getElementById("loading-text");
+const loadingSpiderCanvas = document.getElementById("loading-spider");
+const loadingSpiderCtx = loadingSpiderCanvas.getContext("2d");
 const statusText = document.getElementById("status-text");
 const spiderCountEl = document.getElementById("spider-count");
 const messageBanner = document.getElementById("message-banner");
@@ -167,6 +174,27 @@ function showMessage(text) {
   clearTimeout(messageTimer);
   messageTimer = setTimeout(() => messageBanner.classList.remove("visible"), 3200);
 }
+
+// tiny pixel-art walk cycle for the loading screen — two 9x5 bitmaps toggled
+// while the spider runs across via a CSS animation on the canvas element
+const LOADING_SPIDER_FRAMES = [
+  ["#.#...#.#", ".#.#.#.#.", "..#####..", ".#.#.#.#.", "#.#...#.#"],
+  [".#.#.#.#.", "#.#...#.#", "..#####..", "#.#...#.#", ".#.#.#.#."],
+];
+let loadingFrameIdx = 0;
+function drawLoadingFrame() {
+  loadingSpiderCtx.clearRect(0, 0, 9, 5);
+  loadingSpiderCtx.fillStyle = "#fff";
+  const frame = LOADING_SPIDER_FRAMES[loadingFrameIdx];
+  for (let y = 0; y < frame.length; y++) {
+    for (let x = 0; x < frame[y].length; x++) {
+      if (frame[y][x] === "#") loadingSpiderCtx.fillRect(x, y, 1, 1);
+    }
+  }
+  loadingFrameIdx = 1 - loadingFrameIdx;
+}
+drawLoadingFrame();
+const loadingAnimTimer = setInterval(drawLoadingFrame, 200);
 
 // ---------- face landmarks ----------
 // A spread of points across the face oval plus some interior features (nose,
@@ -314,23 +342,25 @@ function resizeCanvas() {
   canvas.height = appEl.clientHeight;
 }
 
-startBtn.addEventListener("click", async () => {
-  startBtn.disabled = true;
+// no start button — loads the model and requests the camera immediately.
+// The only click left anywhere in this flow is the browser's own native
+// permission prompt, which no page can script around or auto-accept.
+async function init() {
   try {
-    statusText.textContent = "requesting camera...";
-    await startCamera();
-    await initFaceLandmarker();
-    startOverlay.classList.add("hidden");
+    await Promise.all([startCamera(), initFaceLandmarker()]);
+    clearInterval(loadingAnimTimer);
+    loadingOverlay.classList.add("hidden");
     statusText.textContent = "tracking";
     running = true;
     nextSpawnAt = performance.now();
     requestAnimationFrame(loop);
   } catch (err) {
     console.error(err);
-    statusText.textContent = "error: " + err.message;
-    startBtn.disabled = false;
+    clearInterval(loadingAnimTimer);
+    loadingText.textContent = "camera access needed — reload to try again";
   }
-});
+}
+init();
 
 // ---------- per-frame pipeline ----------
 
