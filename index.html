@@ -298,6 +298,20 @@ let currentLandmarks = null;
 let mouthCenter = { x: 0, y: 0 };
 let mouthOpenSince = null;
 
+// head-jolt / dislodge — see updateMouthState and triggerDislodge below
+const HEAD_JOLT_THRESHOLD = 0.035; // fraction of face width moved in one frame to count as a jolt
+const TUMBLE_DURATION_MS = 900;
+const TUMBLE_SPIN_SPEED = 0.35; // radians per frame while tumbling — fast, deliberately disorienting
+let lastFaceCenter = null;
+
+function triggerDislodge(nowMs) {
+  for (const s of spiders) {
+    if (s.state !== "roam") continue; // only spiders actually settled on the face are affected
+    s.tumbling = true;
+    s.tumbleStart = nowMs + Math.random() * 150; // slight per-spider stagger, not a uniform mass-flinch
+  }
+}
+
 let faceLandmarker = null;
 let running = false;
 
@@ -415,6 +429,21 @@ function updateMouthState(landmarks) {
   mouthCenter.y = (py(UPPER_INNER_LIP) + py(LOWER_INNER_LIP)) / 2;
 
   statusText.textContent = mouthIsOpen ? "mouth open — swallowing" : "tracking";
+
+  // head-jolt detection: rather than trying to keep every spider glued to a
+  // moving face in real time (which never tracked convincingly), a fast
+  // head movement instead "dislodges" every spider currently on the face —
+  // they spin in place — and once the head settles, they land back into
+  // normal crawling about a second later.
+  const faceCx = (px(LEFT_FACE) + px(RIGHT_FACE)) / 2;
+  const faceCy = (py(LEFT_FACE) + py(RIGHT_FACE)) / 2;
+  if (lastFaceCenter && faceWidth > 0) {
+    const movement = Math.hypot(faceCx - lastFaceCenter.x, faceCy - lastFaceCenter.y) / faceWidth;
+    if (movement > HEAD_JOLT_THRESHOLD) {
+      triggerDislodge(performance.now());
+    }
+  }
+  lastFaceCenter = { x: faceCx, y: faceCy };
 }
 
 // ---------- video draw + video-space -> canvas-space mapping ----------
@@ -695,6 +724,25 @@ function updateSpiders(nowMs) {
       for (let i = 0; i < LEG_COUNT; i++) s.legPhases[i] += s.legSpeeds[i] * 1.5;
       next.push(s);
       continue;
+    }
+
+    // dislodged by a fast head movement — spins in place rather than trying
+    // (and failing) to track the face live; lands back into normal roaming
+    // once TUMBLE_DURATION_MS has passed without a fresh jolt extending it
+    if (s.tumbling) {
+      if (nowMs - s.tumbleStart >= TUMBLE_DURATION_MS) {
+        s.tumbling = false;
+      } else if (nowMs >= s.tumbleStart) {
+        s.angle += TUMBLE_SPIN_SPEED;
+        for (let i = 0; i < LEG_COUNT; i++) {
+          s.legPhases[i] += s.legSpeeds[i] * 2 + (Math.random() - 0.5) * 0.1;
+        }
+        next.push(s);
+        continue;
+      } else {
+        next.push(s); // staggered start — hasn't begun spinning yet this frame
+        continue;
+      }
     }
 
     // random-walk the pace: pulled gently back toward this spider's own
