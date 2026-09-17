@@ -812,10 +812,11 @@ function updateSpiders(nowMs) {
   spiders = next;
 }
 
+const SPIDER_SIZE_FRACTION = 0.015; // fraction of the screen's shorter side — keeps spiders a consistent relative size on any device
+
 function drawSpider(s) {
   const pos = videoToCanvas(s.x, s.y);
-  const scaleX = canvas.width / coverRect.sw;
-  const size = 6 * (s.drawScale ?? s.scale) * scaleX;
+  const size = SPIDER_SIZE_FRACTION * Math.min(canvas.width, canvas.height) * (s.drawScale ?? s.scale);
   if (size <= 0.1) return;
 
   const behindLens = lensZones.some((z) => Math.hypot(s.x - z.x, s.y - z.y) < z.r);
