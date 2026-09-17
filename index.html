@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>sp1dr</title>
+<style>
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+  font-family: "Courier New", ui-monospace, monospace;
+}
+
+#app {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 160px;
+  min-height: 120px;
+  container-type: inline-size; /* enables the cqw units below, so text scales with the embed's actual width */
+}
+
+#raw-video {
+  display: none;
+}
+
+#scene {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  transform: scaleX(-1); /* mirror the whole scene — feels like a mirror, not a mugshot */
+}
+
+#start-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+#start-overlay.hidden {
+  display: none;
+}
+
+#start-btn {
+  font-family: inherit;
+  font-size: clamp(11px, 4cqw, 16px);
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+  padding: clamp(8px, 3cqw, 14px) clamp(14px, 5cqw, 28px);
+  background: #ff2a2a;
+  color: #000;
+  border: none;
+  cursor: pointer;
+}
+
+#start-btn:hover {
+  background: #ff8a8a;
+}
+
+#start-overlay .hint {
+  color: #ff8a8a;
+  font-size: clamp(9px, 3cqw, 12px);
+  max-width: 90%;
+  text-align: center;
+  opacity: 0.85;
+}
+
+#hud {
+  position: absolute;
+  bottom: clamp(4px, 2cqw, 16px);
+  left: clamp(4px, 2cqw, 16px);
+  right: clamp(4px, 2cqw, 16px);
+  z-index: 9;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: clamp(7px, 2cqw, 11px);
+  color: #ff2a2a;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.9);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+#message-banner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.92);
+  z-index: 8;
+  font-size: clamp(14px, 7cqw, 32px);
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #ff2a2a;
+  text-shadow: 0 0 16px rgba(255, 42, 42, 0.8), 0 2px 8px rgba(0, 0, 0, 0.9);
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+
+#message-banner.visible {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <video id="raw-video" autoplay playsinline muted></video>
+  <canvas id="scene"></canvas>
+
+  <div id="start-overlay">
+    <button id="start-btn">start sp1dr</button>
+    <p class="hint">grants camera access. spiders crawl in from the edges — open your mouth to swallow them.</p>
+  </div>
+
+  <div id="hud">
+    <span id="status-text">idle</span>
+    <span id="spider-count">0 spiders</span>
+  </div>
+
+  <div id="message-banner"></div>
+</div>
+
+<script type="module">
+import {
+  FaceLandmarker,
+  FilesetResolver,
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- DOM ----------
+
+const appEl = document.getElementById("app");
+const rawVideo = document.getElementById("raw-video");
+const canvas = document.getElementById("scene");
+const ctx = canvas.getContext("2d");
+
+const startOverlay = document.getElementById("start-overlay");
+const startBtn = document.getElementById("start-btn");
+const statusText = document.getElementById("status-text");
+const spiderCountEl = document.getElementById("spider-count");
+const messageBanner = document.getElementById("message-banner");
+
+let messageTimer = null;
+function showMessage(text) {
+  messageBanner.textContent = text;
+  messageBanner.classList.add("visible");
+  clearTimeout(messageTimer);
+  messageTimer = setTimeout(() => messageBanner.classList.remove("visible"), 3200);
+}
+
+// ---------- face landmarks ----------
+// A spread of points across the face oval plus some interior features (nose,
+// cheeks) — spiders wander between these, which is what sells "crawling over
+// the face" without a real 3D face mesh.
+const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+const INNER_POINTS = [1, 168, 50, 280, 205, 425, 236, 456, 118, 347];
+const CRAWL_POINTS = FACE_OVAL.concat(INNER_POINTS);
+
+const UPPER_INNER_LIP = 13;
+const LOWER_INNER_LIP = 14;
+const LEFT_FACE = 234;
+const RIGHT_FACE = 454;
+const CHIN = 152;
+
+// eye corner landmarks, used to approximate where glasses lenses would sit.
+// There's no real way to detect actual glasses from face landmarks alone —
+// this just treats the eye area (padded out a bit, since lenses are usually
+// bigger than the eye opening) as a "behind the lens" zone regardless of
+// whether glasses are actually being worn.
+const LEFT_EYE_OUTER = 33;
+const LEFT_EYE_INNER = 133;
+const RIGHT_EYE_OUTER = 263;
+const RIGHT_EYE_INNER = 362;
+const LENS_ALPHA = 0.35;
+
+// mouth-open detection uses hysteresis (different open/close thresholds) so
+// it doesn't flicker right at the boundary
+const MOUTH_OPEN_THRESHOLD = 0.16;
+const MOUTH_CLOSE_THRESHOLD = 0.1;
+let mouthIsOpen = false;
+
+// ---------- spider swarm ----------
+
+// continuous trickle rather than discrete waves: whenever the population is
+// below the cap, spawn one more at a steady interval — no "wave clears, then
+// a dead pause before the next one starts" gap
+const SPAWN_INTERVAL_MS = 90; // no on-screen population cap — they just keep coming at this rate
+const LIFETIME_TARGET = 100; // total spawned before the "you ate them all" switch — testing value, real target is 1000
+const REGURGITATE_INTERVAL_MS = 45; // spawn rate once spiders start coming back OUT of the mouth
+let nextSpawnAt = 0;
+let totalSpawned = 0;
+
+// two phases: "eating" is the normal swallow game; once every spider has been
+// spawned and eaten, it flips to "aftermath" — now opening the mouth makes
+// spiders crawl back OUT instead of drawing them in
+let phase = "eating";
+
+const ROAM_SPEED = 0.16;
+const ENTER_SPEED = 0.3;
+const RETARGET_MIN_MS = 900;
+const RETARGET_MAX_MS = 2400;
+const REACH_RADIUS = 14;
+const EATEN_RADIUS = 20;
+
+// wandering feel: heading turns gradually toward its target instead of
+// snapping straight at it, plus a slow side-to-side wobble on top.
+const STEER_EASE = 0.06;
+const WOBBLE_AMOUNT = 0.5;
+const WOBBLE_SPEED = 0.02;
+
+// fleeing spiders re-point straight at the mouth fresh every frame (no eased
+// turn, so no lagging arc/spiral), but still wobble on top of that — a faster,
+// jitterier wobble than roaming, since they're scrambling, not wandering
+const FLEE_WOBBLE_AMOUNT = 0.65;
+const FLEE_WOBBLE_SPEED = 0.09;
+
+// the drain, once your mouth opens, isn't instant — each spider has its own
+// delay before it joins the rush to the mouth, spread across this window, so
+// clearing a whole wave means holding your mouth open for a while
+const DRAIN_WINDOW_MS = 4000;
+
+// once a spider reaches the mouth it shrinks away over this long instead of
+// just vanishing, so it reads as crawling inside rather than popping — slow,
+// for tension
+const VANISH_DURATION_MS = 1600;
+
+// each spider has its own baseline pace — most are normal-ish, a chunk are
+// noticeably slow crawlers — and then continuously drifts up and down around
+// that personal baseline (an Ornstein-Uhlenbeck-style random walk) rather
+// than holding one fixed speed its whole life
+const SPEED_DRIFT_PULL = 0.01;
+const SPEED_DRIFT_JITTER = 0.06;
+const SPEED_MULT_MIN = 0.32; // floor high enough that "slow" still visibly crawls rather than reading as stopped
+const SPEED_MULT_MAX = 2.2;
+
+// 8 legs, each fully independent (own angle, own phase, own speed) — all
+// radiating from a single point at the body's centre, between head and
+// abdomen, the way a real spider's legs attach to its cephalothorax.
+const LEG_COUNT = 8;
+const LEG_BASE_ANGLES = [];
+for (let i = 0; i < 4; i++) {
+  const a = Math.PI * (0.22 + i * 0.16); // 4 angles per side, spread from near-front to near-back along the flanks
+  LEG_BASE_ANGLES.push(a, -a);
+}
+const LEG_WAG_ANGLE = 0.5; // how far each leg swings, in radians
+const LEG_BEND = 0.65; // knee bend angle, away from the body — this is what makes a leg read as jointed rather than a straight spoke
+
+let spiders = [];
+let currentLandmarks = null;
+let mouthCenter = { x: 0, y: 0 };
+let mouthOpenSince = null;
+
+let faceLandmarker = null;
+let running = false;
+
+// ---------- setup ----------
+
+async function initFaceLandmarker() {
+  statusText.textContent = "loading model...";
+  const filesetResolver = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numFaces: 1,
+  });
+}
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 1280, height: 720, facingMode: "user" },
+    audio: false,
+  });
+  rawVideo.srcObject = stream;
+  await new Promise((resolve) => {
+    rawVideo.onloadedmetadata = () => resolve();
+  });
+  rawVideo.play();
+
+  resizeCanvas();
+  new ResizeObserver(resizeCanvas).observe(appEl);
+}
+
+function resizeCanvas() {
+  // sized to the #app container, not the window — this is what makes it
+  // behave correctly inside a constrained iframe rather than assuming a
+  // full-page viewport
+  canvas.width = appEl.clientWidth;
+  canvas.height = appEl.clientHeight;
+}
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+  try {
+    statusText.textContent = "requesting camera...";
+    await startCamera();
+    await initFaceLandmarker();
+    startOverlay.classList.add("hidden");
+    statusText.textContent = "tracking";
+    running = true;
+    nextSpawnAt = performance.now();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    statusText.textContent = "error: " + err.message;
+    startBtn.disabled = false;
+  }
+});
+
+// ---------- per-frame pipeline ----------
+
+function loop(nowMs) {
+  if (!running) return;
+
+  const result = faceLandmarker.detectForVideo(rawVideo, nowMs);
+  if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+    currentLandmarks = result.faceLandmarks[0];
+    updateMouthState(currentLandmarks);
+  } else {
+    currentLandmarks = null;
+  }
+
+  drawScene();
+  updateSpiders(nowMs);
+  checkPhaseTransition();
+  maintainSpawning(nowMs);
+
+  let statusLine;
+  if (phase === "eating") {
+    statusLine = `${totalSpawned.toLocaleString()} / ${LIFETIME_TARGET.toLocaleString()} total`;
+  } else if (phase === "aftermath") {
+    statusLine = `aftermath (${aftermathSpawned}/${LIFETIME_TARGET})`;
+  } else {
+    statusLine = "done";
+  }
+  spiderCountEl.textContent = `${spiders.length} on screen · ${statusLine}`;
+
+  requestAnimationFrame(loop);
+}
+
+function updateMouthState(landmarks) {
+  const w = rawVideo.videoWidth;
+  const h = rawVideo.videoHeight;
+  const px = (i) => landmarks[i].x * w;
+  const py = (i) => landmarks[i].y * h;
+
+  const faceWidth = Math.hypot(px(RIGHT_FACE) - px(LEFT_FACE), py(RIGHT_FACE) - py(LEFT_FACE));
+  const mouthOpen = Math.hypot(px(UPPER_INNER_LIP) - px(LOWER_INNER_LIP), py(UPPER_INNER_LIP) - py(LOWER_INNER_LIP));
+  const ratio = faceWidth > 0 ? mouthOpen / faceWidth : 0;
+
+  if (mouthIsOpen && ratio < MOUTH_CLOSE_THRESHOLD) {
+    mouthIsOpen = false;
+    mouthOpenSince = null;
+  } else if (!mouthIsOpen && ratio > MOUTH_OPEN_THRESHOLD) {
+    mouthIsOpen = true;
+    mouthOpenSince = performance.now();
+  }
+
+  mouthCenter.x = (px(UPPER_INNER_LIP) + px(LOWER_INNER_LIP)) / 2;
+  mouthCenter.y = (py(UPPER_INNER_LIP) + py(LOWER_INNER_LIP)) / 2;
+
+  statusText.textContent = mouthIsOpen ? "mouth open — swallowing" : "tracking";
+}
+
+// ---------- video draw + video-space -> canvas-space mapping ----------
+
+let coverRect = { sx: 0, sy: 0, sw: 0, sh: 0 };
+
+function computeCoverRect() {
+  const vw = rawVideo.videoWidth;
+  const vh = rawVideo.videoHeight;
+  const videoAspect = vw / vh;
+  const canvasAspect = canvas.width / canvas.height;
+
+  if (videoAspect > canvasAspect) {
+    const sh = vh;
+    const sw = vh * canvasAspect;
+    coverRect = { sx: (vw - sw) / 2, sy: 0, sw, sh };
+  } else {
+    const sw = vw;
+    const sh = vw / canvasAspect;
+    coverRect = { sx: 0, sy: (vh - sh) / 2, sw, sh };
+  }
+}
+
+function videoToCanvas(x, y) {
+  return {
+    x: (x - coverRect.sx) * (canvas.width / coverRect.sw),
+    y: (y - coverRect.sy) * (canvas.height / coverRect.sh),
+  };
+}
+
+let lensZones = []; // [{x, y, r}] in video-pixel space
+
+function computeLensZones() {
+  lensZones = [];
+  if (!currentLandmarks) return;
+  const w = rawVideo.videoWidth;
+  const h = rawVideo.videoHeight;
+  const px = (i) => currentLandmarks[i].x * w;
+  const py = (i) => currentLandmarks[i].y * h;
+
+  for (const [outer, inner] of [[LEFT_EYE_OUTER, LEFT_EYE_INNER], [RIGHT_EYE_OUTER, RIGHT_EYE_INNER]]) {
+    const cx = (px(outer) + px(inner)) / 2;
+    const cy = (py(outer) + py(inner)) / 2;
+    const eyeWidth = Math.hypot(px(outer) - px(inner), py(outer) - py(inner));
+    lensZones.push({ x: cx, y: cy, r: eyeWidth * 1.1 });
+  }
+}
+
+// aftermath-only video treatment: monochrome, chunky-pixelated, glitchy.
+// Rendered onto a small offscreen canvas first (that's the pixelation — a
+// nearest-neighbour upscale of a low-res draw), then torn with random strip
+// displacement. Spiders are drawn after, on the main canvas, so they stay
+// crisp on top of this rather than getting pixelated themselves.
+const pixelCanvas = document.createElement("canvas");
+const pixelCtx = pixelCanvas.getContext("2d");
+const AFTERMATH_PIXEL_WIDTH = 160;
+const GLITCH_CHANCE = 0.3; // per frame, while in aftermath
+
+function drawScene() {
+  computeCoverRect();
+  computeLensZones();
+
+  if (phase === "aftermath") {
+    pixelCanvas.width = AFTERMATH_PIXEL_WIDTH;
+    pixelCanvas.height = Math.round((AFTERMATH_PIXEL_WIDTH * canvas.height) / canvas.width) || 1;
+
+    pixelCtx.filter = "grayscale(1) contrast(1.35)";
+    pixelCtx.drawImage(
+      rawVideo,
+      coverRect.sx, coverRect.sy, coverRect.sw, coverRect.sh,
+      0, 0, pixelCanvas.width, pixelCanvas.height
+    );
+    pixelCtx.filter = "none";
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(pixelCanvas, 0, 0, pixelCanvas.width, pixelCanvas.height, 0, 0, canvas.width, canvas.height);
+    ctx.imageSmoothingEnabled = true;
+
+    if (Math.random() < GLITCH_CHANCE) {
+      const tearCount = 1 + Math.floor(Math.random() * 2);
+      for (let t = 0; t < tearCount; t++) {
+        const stripHeight = 4 + Math.floor(Math.random() * (canvas.height * 0.05));
+        const stripY = Math.floor(Math.random() * Math.max(1, canvas.height - stripHeight));
+        const stripShift = Math.round((Math.random() - 0.5) * canvas.width * 0.3);
+        const strip = ctx.getImageData(0, stripY, canvas.width, stripHeight);
+        ctx.putImageData(strip, stripShift, stripY);
+      }
+    }
+  } else {
+    ctx.drawImage(
+      rawVideo,
+      coverRect.sx, coverRect.sy, coverRect.sw, coverRect.sh,
+      0, 0, canvas.width, canvas.height
+    );
+  }
+
+  for (const s of spiders) {
+    drawSpider(s);
+  }
+}
+
+// ---------- spiders ----------
+
+function createSpider(x, y, enterStage, initialAngle) {
+  const spider = {
+    x, y,
+    state: "entering",
+    enterStage, // 0 = heading to the chin first, 1 = heading straight to the final face target
+    targetIdx: Math.floor(Math.random() * CRAWL_POINTS.length),
+    nextRetargetAt: 0,
+    angle: initialAngle,
+    scale: 0.5 + Math.random() * 0.65, // real size variety — some tiny, some larger, capped well below the old giants
+    baseSpeedMult: rollBaseSpeedMult(),
+    speedMult: 1, // drifts toward baseSpeedMult at runtime — see SPEED_DRIFT_* below
+    legPhases: Array.from({ length: LEG_COUNT }, () => Math.random() * Math.PI * 2),
+    legSpeeds: Array.from({ length: LEG_COUNT }, () => 0.04 + Math.random() * 0.12),
+    legAngleJitter: LEG_BASE_ANGLES.map(() => (Math.random() - 0.5) * 0.3),
+    legLengthMult: LEG_BASE_ANGLES.map(() => 0.85 + Math.random() * 0.4),
+    wobblePhase: Math.random() * Math.PI * 2,
+    drainDelay: Math.random() * DRAIN_WINDOW_MS,
+  };
+  spiders.push(spider);
+  totalSpawned++;
+  return spider;
+}
+
+function spawnSpider() {
+  const w = rawVideo.videoWidth;
+  const h = rawVideo.videoHeight;
+
+  // spawns from the bottom-centre, just off screen — like it's climbing up
+  // from below and onto the neck, not entering from any wall
+  const x = w * 0.5 + (Math.random() - 0.5) * w * 0.2;
+  const y = h + 10;
+  createSpider(x, y, 0, -Math.PI / 2); // facing up, climbs to the chin first
+}
+
+// aftermath phase: spiders crawl back OUT of the mouth, straight up off the
+// face, then loop the outer border of the screen forever — released, not
+// re-eaten, so they get their own movement mode entirely (see
+// updateReleasedSpider below) rather than the normal state machine.
+let aftermathSpawned = 0;
+function spawnFromMouth() {
+  const s = createSpider(mouthCenter.x, mouthCenter.y, 1, -Math.PI / 2);
+  s.state = "released";
+  s.aftermathMode = true;
+  aftermathSpawned++;
+}
+
+// most spiders are medium-to-slow, a small minority are noticeably quick —
+// creepier as a crowd when the baseline pace is unhurried
+function rollBaseSpeedMult() {
+  const roll = Math.random();
+  if (roll < 0.12) return 1.2 + Math.random() * 0.9; // quick
+  if (roll < 0.4) return 0.6 + Math.random() * 0.35; // medium
+  return 0.32 + Math.random() * 0.25; // slow — the majority, still clearly moving
+}
+
+// continuous trickle: top up toward the population cap at a steady interval,
+// so there's never a dead gap after a mouth-open clears a bunch out
+function maintainSpawning(nowMs) {
+  if (phase === "eating") {
+    if (totalSpawned >= LIFETIME_TARGET) return;
+    if (nowMs < nextSpawnAt) return;
+    spawnSpider();
+    nextSpawnAt = nowMs + SPAWN_INTERVAL_MS;
+    return;
+  }
+
+  // aftermath: only comes back out while the mouth is actually open, and
+  // only until the same number that went in has come back out
+  if (phase !== "aftermath") return;
+  if (aftermathSpawned >= LIFETIME_TARGET) return;
+  if (!mouthIsOpen) return;
+  if (nowMs < nextSpawnAt) return;
+  spawnFromMouth();
+  nextSpawnAt = nowMs + REGURGITATE_INTERVAL_MS;
+}
+
+function checkPhaseTransition() {
+  if (phase === "eating") {
+    if (totalSpawned < LIFETIME_TARGET) return;
+    if (spiders.length > 0) return;
+    phase = "aftermath";
+    showMessage("you ate them all");
+    return;
+  }
+
+  if (phase === "aftermath") {
+    // once every spider that went in has come back out, the colour swap ends
+    if (aftermathSpawned < LIFETIME_TARGET) return;
+    phase = "normal";
+  }
+}
+
+// Released (aftermath) spiders: climb straight up off the face until they
+// reach the top of the screen, then loop the outer border forever. The loop
+// is walked as a single scalar distance along the rectangle's perimeter
+// (starting at the top-left corner, increasing clockwise), which sidesteps
+// needing separate per-edge logic or explicit corner-turning code.
+function updateReleasedSpider(s) {
+  const bounds = {
+    left: coverRect.sx,
+    right: coverRect.sx + coverRect.sw,
+    top: coverRect.sy,
+    bottom: coverRect.sy + coverRect.sh,
+  };
+  const speed = ROAM_SPEED * s.speedMult;
+
+  if (s.state === "released") {
+    s.angle = -Math.PI / 2; // straight up
+    s.y -= speed;
+    s.wobblePhase += WOBBLE_SPEED;
+    s.x += Math.sin(s.wobblePhase) * 0.4; // gentle drift while climbing, not a dead-straight line
+    for (let i = 0; i < LEG_COUNT; i++) {
+      s.legPhases[i] += s.legSpeeds[i] + (Math.random() - 0.5) * 0.02;
+    }
+
+    if (s.y <= bounds.top) {
+      s.y = bounds.top;
+      s.state = "perimeter";
+      s.perimDir = Math.random() < 0.5 ? 1 : -1; // clockwise or counter-clockwise, per spider
+      s.perimPos = clamp(s.x - bounds.left, 0, bounds.right - bounds.left - 1);
+    }
+    return;
+  }
+
+  // perimeter
+  const W = bounds.right - bounds.left;
+  const H = bounds.bottom - bounds.top;
+  const perimeterLength = 2 * W + 2 * H;
+
+  const nextPos = ((s.perimPos + s.perimDir * speed) % perimeterLength + perimeterLength) % perimeterLength;
+  const p0 = perimeterPoint(s.perimPos, bounds, W, H);
+  const p1 = perimeterPoint(nextPos, bounds, W, H);
+
+  s.angle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+  s.x = p1.x;
+  s.y = p1.y;
+  s.perimPos = nextPos;
+
+  for (let i = 0; i < LEG_COUNT; i++) {
+    s.legPhases[i] += s.legSpeeds[i] + (Math.random() - 0.5) * 0.02;
+  }
+}
+
+// maps a distance along the perimeter (0 = top-left corner, increasing
+// clockwise) to an (x, y) point on the rectangle's border
+function perimeterPoint(pos, bounds, W, H) {
+  if (pos < W) return { x: bounds.left + pos, y: bounds.top };
+  pos -= W;
+  if (pos < H) return { x: bounds.right, y: bounds.top + pos };
+  pos -= H;
+  if (pos < W) return { x: bounds.right - pos, y: bounds.bottom };
+  pos -= W;
+  return { x: bounds.left, y: bounds.bottom - pos };
+}
+
+function updateSpiders(nowMs) {
+  if (!currentLandmarks) return;
+
+  const w = rawVideo.videoWidth;
+  const h = rawVideo.videoHeight;
+  const px = (i) => currentLandmarks[i].x * w;
+  const py = (i) => currentLandmarks[i].y * h;
+
+  const next = [];
+
+  for (const s of spiders) {
+    // already crawling into the mouth and shrinking away — handled entirely
+    // separately from normal movement
+    if (s.state === "vanishing") {
+      const t = (nowMs - s.vanishStart) / VANISH_DURATION_MS;
+      if (t >= 1) continue; // fully shrunk — remove
+      s.drawScale = s.scale * (1 - t);
+      s.x += (mouthCenter.x - s.x) * 0.15;
+      s.y += (mouthCenter.y - s.y) * 0.15;
+      for (let i = 0; i < LEG_COUNT; i++) s.legPhases[i] += s.legSpeeds[i] * 1.5;
+      next.push(s);
+      continue;
+    }
+
+    // random-walk the pace: pulled gently back toward this spider's own
+    // baseline plus fresh jitter every frame, so it speeds up and slows down
+    // unpredictably over its journey, around a personal norm rather than a
+    // shared one — some spiders are just slow, all the time
+    s.speedMult += (s.baseSpeedMult - s.speedMult) * SPEED_DRIFT_PULL + (Math.random() - 0.5) * SPEED_DRIFT_JITTER;
+    s.speedMult = clamp(s.speedMult, SPEED_MULT_MIN, SPEED_MULT_MAX);
+
+    // released spiders (aftermath) have their own lifelong movement mode —
+    // they never eat, flee, or roam the face; they climb off it and loop the
+    // screen border forever
+    if (s.aftermathMode) {
+      updateReleasedSpider(s);
+      next.push(s);
+      continue;
+    }
+
+    // mouth is open, but each spider only joins the rush once it's held open
+    // longer than that spider's personal delay — a gradual drain, not a snap
+    // only the "eating" phase sucks spiders into the mouth — once we've
+    // flipped to "aftermath" an open mouth spawns new ones instead, and
+    // anything already crawling around should just keep roaming
+    const shouldFlee = phase === "eating" && mouthIsOpen && nowMs - mouthOpenSince >= s.drainDelay;
+
+    let targetX, targetY, speed;
+
+    if (shouldFlee) {
+      // no burst of speed — it's purely a change of destination. Reaching the
+      // mouth takes as long as it takes at this spider's normal crawling pace.
+      s.state = "fleeing";
+      targetX = mouthCenter.x;
+      targetY = mouthCenter.y;
+      speed = ROAM_SPEED * s.speedMult;
+    } else {
+      if (s.state === "fleeing") {
+        s.state = "roam";
+        s.nextRetargetAt = 0; // force an immediate retarget away from the mouth
+      }
+      if (s.state === "entering") {
+        speed = ENTER_SPEED * s.speedMult;
+        if (s.enterStage === 0) {
+          targetX = px(CHIN);
+          targetY = py(CHIN);
+        } else {
+          const landmarkIdx = CRAWL_POINTS[s.targetIdx];
+          targetX = px(landmarkIdx);
+          targetY = py(landmarkIdx);
+        }
+      } else {
+        speed = ROAM_SPEED * s.speedMult;
+        if (nowMs > s.nextRetargetAt) {
+          s.targetIdx = Math.floor(Math.random() * CRAWL_POINTS.length);
+          s.nextRetargetAt = nowMs + RETARGET_MIN_MS + Math.random() * (RETARGET_MAX_MS - RETARGET_MIN_MS);
+        }
+        const landmarkIdx = CRAWL_POINTS[s.targetIdx];
+        targetX = px(landmarkIdx);
+        targetY = py(landmarkIdx);
+      }
+    }
+
+    const dx = targetX - s.x;
+    const dy = targetY - s.y;
+    const dist = Math.hypot(dx, dy) || 1;
+
+    // ease heading toward the target rather than snapping straight at it —
+    // but only while roaming. A fleeing spider points straight at the mouth
+    // immediately: any eased turn-in still traces a visible arc when only a
+    // few spiders are left, which reads as a spiral. Point-and-go avoids that
+    // entirely, at any population size.
+    const desiredAngle = Math.atan2(dy, dx);
+
+    let movingAngle;
+    if (shouldFlee) {
+      // heading snaps straight at the mouth fresh every frame — no lag, so
+      // no arc/spiral — but the actual travel direction still wobbles on top
+      s.angle = desiredAngle;
+      s.wobblePhase += FLEE_WOBBLE_SPEED;
+      movingAngle = desiredAngle + Math.sin(s.wobblePhase) * FLEE_WOBBLE_AMOUNT;
+    } else {
+      let angleDiff = desiredAngle - s.angle;
+      angleDiff = Math.atan2(Math.sin(angleDiff), Math.cos(angleDiff)); // shortest turn direction
+      s.angle += angleDiff * STEER_EASE;
+      s.wobblePhase += WOBBLE_SPEED;
+      movingAngle = s.angle + Math.sin(s.wobblePhase) * WOBBLE_AMOUNT;
+    }
+
+    s.x += Math.cos(movingAngle) * speed;
+    s.y += Math.sin(movingAngle) * speed;
+    for (let i = 0; i < LEG_COUNT; i++) {
+      // every leg has its own speed already; add jitter on top so no two
+      // legs, on any spider, ever move in lockstep
+      s.legPhases[i] += s.legSpeeds[i] + (Math.random() - 0.5) * 0.02;
+    }
+
+    if (shouldFlee && dist < EATEN_RADIUS) {
+      s.state = "vanishing";
+      s.vanishStart = nowMs;
+      s.drawScale = s.scale;
+      next.push(s);
+      continue;
+    }
+    if (s.state === "entering" && dist < REACH_RADIUS) {
+      if (s.enterStage < 1) {
+        s.enterStage++;
+      } else {
+        s.state = "roam";
+        s.nextRetargetAt = nowMs + RETARGET_MIN_MS + Math.random() * (RETARGET_MAX_MS - RETARGET_MIN_MS);
+      }
+    }
+
+    next.push(s);
+  }
+
+  spiders = next;
+}
+
+function drawSpider(s) {
+  const pos = videoToCanvas(s.x, s.y);
+  const scaleX = canvas.width / coverRect.sw;
+  const size = 6 * (s.drawScale ?? s.scale) * scaleX;
+  if (size <= 0.1) return;
+
+  const behindLens = lensZones.some((z) => Math.hypot(s.x - z.x, s.y - z.y) < z.r);
+
+  ctx.save();
+  ctx.translate(pos.x, pos.y);
+  ctx.rotate(s.angle);
+  ctx.globalAlpha = behindLens ? LENS_ALPHA : 1;
+  ctx.fillStyle = "#0a0a0a";
+  ctx.strokeStyle = "#0a0a0a";
+  ctx.lineWidth = Math.max(1, size * 0.09);
+
+  // two body segments, like a real spider: a larger abdomen trailing behind,
+  // a smaller head (cephalothorax) up front where the legs attach
+  ctx.beginPath();
+  ctx.ellipse(-size * 0.25, 0, size * 0.42, size * 0.32, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.ellipse(size * 0.35, 0, size * 0.22, size * 0.2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 8 jointed legs (hip -> knee -> foot), each fully independent, all
+  // radiating from the body's centre point (0,0) — right where the head and
+  // abdomen segments meet. The knee bends further away from the body than
+  // the hip segment, which is what reads as a real jointed leg rather than a
+  // straight spoke.
+  for (let i = 0; i < LEG_COUNT; i++) {
+    const baseAngle = LEG_BASE_ANGLES[i] + s.legAngleJitter[i] + Math.sin(s.legPhases[i]) * LEG_WAG_ANGLE;
+    const side = Math.sign(LEG_BASE_ANGLES[i]) || 1;
+    const len = size * 1.3 * s.legLengthMult[i];
+
+    const femurLen = len * 0.48;
+    const kneeX = Math.cos(baseAngle) * femurLen;
+    const kneeY = Math.sin(baseAngle) * femurLen;
+
+    const tibiaAngle = baseAngle + side * LEG_BEND;
+    const tibiaLen = len * 0.62;
+    const footX = kneeX + Math.cos(tibiaAngle) * tibiaLen;
+    const footY = kneeY + Math.sin(tibiaAngle) * tibiaLen;
+
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(kneeX, kneeY);
+    ctx.lineTo(footX, footY);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v));
+}
+</script>
+</body>
+</html>
