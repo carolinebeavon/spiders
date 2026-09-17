@@ -168,11 +168,17 @@ const spiderCountEl = document.getElementById("spider-count");
 const messageBanner = document.getElementById("message-banner");
 
 let messageTimer = null;
-function showMessage(text) {
+function showMessage(text, persistent = false) {
   messageBanner.textContent = text;
   messageBanner.classList.add("visible");
   clearTimeout(messageTimer);
-  messageTimer = setTimeout(() => messageBanner.classList.remove("visible"), 3200);
+  if (!persistent) {
+    messageTimer = setTimeout(() => messageBanner.classList.remove("visible"), 3200);
+  }
+}
+function hideMessage() {
+  clearTimeout(messageTimer);
+  messageBanner.classList.remove("visible");
 }
 
 // tiny pixel-art walk cycle for the loading screen — two 9x5 bitmaps toggled
@@ -233,15 +239,21 @@ let mouthIsOpen = false;
 // below the cap, spawn one more at a steady interval — no "wave clears, then
 // a dead pause before the next one starts" gap
 const SPAWN_INTERVAL_MS = 90; // no on-screen population cap — they just keep coming at this rate
-const LIFETIME_TARGET = 100; // total spawned before the "you ate them all" switch — testing value, real target is 1000
+const LIFETIME_TARGET = 100; // total spawned per round — testing value, real target is 1000
 const REGURGITATE_INTERVAL_MS = 45; // spawn rate once spiders start coming back OUT of the mouth
+const MOUTH_HOLD_BEFORE_EXPEL_MS = 1000; // must hold the mouth open this long before anything comes back out
+const PAUSE_DURATION_MS = 1800; // beat between rounds, while the status message plays
 let nextSpawnAt = 0;
 let totalSpawned = 0;
 
-// two phases: "eating" is the normal swallow game; once every spider has been
-// spawned and eaten, it flips to "aftermath" — now opening the mouth makes
-// spiders crawl back OUT instead of drawing them in
+// the game now cycles forever: "eating" (swallow a fresh batch) -> "paused"
+// (a beat, with a status message) -> "aftermath" (hold your mouth open to
+// expel them, they scatter and loop the screen border) -> "paused" -> back
+// to "eating" (the same released spiders become swallowable again) -> ...
 let phase = "eating";
+let pauseUntil = 0;
+let pauseNextPhase = null;
+let openWideMessageVisible = false;
 
 const ROAM_SPEED = 0.16;
 const ENTER_SPEED = 0.3;
@@ -298,23 +310,41 @@ let currentLandmarks = null;
 let mouthCenter = { x: 0, y: 0 };
 let mouthOpenSince = null;
 
-// head-jolt / startle-jump — see updateMouthState and triggerDislodge below.
-// A fast head movement makes every settled spider hop in place: it briefly
-// scales up (reads as lifting off the surface) with a faint shadow marking
-// where it'll land, then settles back to normal size and resumes crawling.
-const HEAD_JOLT_THRESHOLD = 0.035; // fraction of face width moved in one frame to count as a jolt
-const JUMP_DURATION_MS = 500;
-const JUMP_SCALE_BOOST = 0.2; // peak size increase, e.g. 0.2 = 20% bigger at the top of the hop
-const JUMP_SHADOW_ALPHA = 0.3; // peak shadow opacity
+// head movement: while the head is moving, every settled spider scatters to
+// a fast, spinning, random point rather than trying (and failing) to track
+// the face live. The instant the head stops, each one flies — fast, still
+// spinning — to whatever face landmark is now nearest to it, and resumes
+// normal crawling from there.
+const HEAD_JOLT_THRESHOLD = 0.035; // fraction of face width moved in one frame to count as movement
+const FLY_SPEED = 4.5; // video-px per frame — deliberately much faster than roaming
+const FLY_SPIN_SPEED = 0.7; // radians per frame while airborne
 let lastFaceCenter = null;
+let headMoving = false;
 
-function triggerDislodge(nowMs) {
-  for (const s of spiders) {
-    if (s.state !== "roam") continue; // only spiders actually settled on the face are affected
-    if (s.tumbling) continue; // already mid-hop — let it finish rather than restarting the arc
-    s.tumbling = true;
-    s.tumbleStart = nowMs + Math.random() * 150; // slight per-spider stagger, not a uniform mass-flinch
+function assignScatterTarget(s) {
+  const w = rawVideo.videoWidth;
+  const h = rawVideo.videoHeight;
+  s.airTargetX = Math.random() * w;
+  s.airTargetY = Math.random() * h;
+}
+
+function assignNearestLandingTarget(s, px, py) {
+  let bestDist = Infinity;
+  let bestIdx = 0;
+  for (let i = 0; i < CRAWL_POINTS.length; i++) {
+    const lm = CRAWL_POINTS[i];
+    const dx = px(lm) - s.x;
+    const dy = py(lm) - s.y;
+    const d = dx * dx + dy * dy;
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
   }
+  s.targetIdx = bestIdx;
+  const lm = CRAWL_POINTS[bestIdx];
+  s.airTargetX = px(lm);
+  s.airTargetY = py(lm);
 }
 
 let faceLandmarker = null;
@@ -396,16 +426,16 @@ function loop(nowMs) {
 
   drawScene();
   updateSpiders(nowMs);
-  checkPhaseTransition();
+  checkPhaseTransition(nowMs);
   maintainSpawning(nowMs);
 
   let statusLine;
   if (phase === "eating") {
     statusLine = `${totalSpawned.toLocaleString()} / ${LIFETIME_TARGET.toLocaleString()} total`;
   } else if (phase === "aftermath") {
-    statusLine = `aftermath (${aftermathSpawned}/${LIFETIME_TARGET})`;
+    statusLine = `hold mouth open — ${aftermathSpawned}/${LIFETIME_TARGET} out`;
   } else {
-    statusLine = "done";
+    statusLine = "…";
   }
   spiderCountEl.textContent = `${spiders.length} on screen · ${statusLine}`;
 
@@ -435,18 +465,15 @@ function updateMouthState(landmarks) {
 
   statusText.textContent = mouthIsOpen ? "mouth open — swallowing" : "tracking";
 
-  // head-jolt detection: rather than trying to keep every spider glued to a
-  // moving face in real time (which never tracked convincingly), a fast
-  // head movement instead "dislodges" every spider currently on the face —
-  // they spin in place — and once the head settles, they land back into
-  // normal crawling about a second later.
+  // head-movement detection: rather than trying to keep every spider glued
+  // to a moving face in real time (which never tracked convincingly), just
+  // know whether the head is currently moving fast — see updateSpiders for
+  // what happens to roaming spiders as a result.
   const faceCx = (px(LEFT_FACE) + px(RIGHT_FACE)) / 2;
   const faceCy = (py(LEFT_FACE) + py(RIGHT_FACE)) / 2;
   if (lastFaceCenter && faceWidth > 0) {
     const movement = Math.hypot(faceCx - lastFaceCenter.x, faceCy - lastFaceCenter.y) / faceWidth;
-    if (movement > HEAD_JOLT_THRESHOLD) {
-      triggerDislodge(performance.now());
-    }
+    headMoving = movement > HEAD_JOLT_THRESHOLD;
   }
   lastFaceCenter = { x: faceCx, y: faceCy };
 }
@@ -618,29 +645,47 @@ function maintainSpawning(nowMs) {
     return;
   }
 
-  // aftermath: only comes back out while the mouth is actually open, and
-  // only until the same number that went in has come back out
   if (phase !== "aftermath") return;
   if (aftermathSpawned >= LIFETIME_TARGET) return;
   if (!mouthIsOpen) return;
+  if (nowMs - mouthOpenSince < MOUTH_HOLD_BEFORE_EXPEL_MS) return; // must hold it open, not just flash it
+  if (openWideMessageVisible) {
+    hideMessage();
+    openWideMessageVisible = false;
+  }
   if (nowMs < nextSpawnAt) return;
   spawnFromMouth();
   nextSpawnAt = nowMs + REGURGITATE_INTERVAL_MS;
 }
 
-function checkPhaseTransition() {
+function checkPhaseTransition(nowMs) {
+  if (phase === "paused") {
+    if (nowMs < pauseUntil) return;
+    phase = pauseNextPhase;
+    if (phase === "aftermath") {
+      aftermathSpawned = 0;
+      showMessage("now open wide", true); // persists until the hold requirement is met
+      openWideMessageVisible = true;
+    }
+    return;
+  }
+
   if (phase === "eating") {
-    if (totalSpawned < LIFETIME_TARGET) return;
-    if (spiders.length > 0) return;
-    phase = "aftermath";
+    if (totalSpawned < LIFETIME_TARGET) return; // first round is still spawning
+    if (spiders.length > 0) return; // still some to swallow
+    phase = "paused";
+    pauseUntil = nowMs + PAUSE_DURATION_MS;
+    pauseNextPhase = "aftermath";
     showMessage("you ate them all");
     return;
   }
 
   if (phase === "aftermath") {
-    // once every spider that went in has come back out, the colour swap ends
-    if (aftermathSpawned < LIFETIME_TARGET) return;
-    phase = "normal";
+    if (aftermathSpawned < LIFETIME_TARGET) return; // still expelling
+    phase = "paused";
+    pauseUntil = nowMs + PAUSE_DURATION_MS;
+    pauseNextPhase = "eating";
+    showMessage("here they come again");
   }
 }
 
@@ -731,30 +776,46 @@ function updateSpiders(nowMs) {
       continue;
     }
 
-    // dislodged by a fast head movement — a startle hop (scale up, faint
-    // ground shadow, settle back down) rather than trying, and failing, to
-    // track the face live
-    if (s.tumbling) {
-      if (nowMs < s.tumbleStart) {
-        next.push(s); // staggered start — hasn't begun this frame yet
-        continue;
+    // head is moving — a settled spider gets flung to a random point rather
+    // than trying (and failing) to track the face live
+    if (s.state === "roam" && !s.airborne && headMoving) {
+      s.airborne = true;
+      s.airPhase = "out";
+      assignScatterTarget(s);
+    }
+
+    if (s.airborne) {
+      const speed = FLY_SPEED * s.speedMult;
+      s.angle += FLY_SPIN_SPEED;
+
+      const dx = s.airTargetX - s.x;
+      const dy = s.airTargetY - s.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      s.x += (dx / dist) * speed;
+      s.y += (dy / dist) * speed;
+
+      for (let i = 0; i < LEG_COUNT; i++) {
+        s.legPhases[i] += s.legSpeeds[i] * 2 + (Math.random() - 0.5) * 0.1;
       }
-      const elapsed = nowMs - s.tumbleStart;
-      if (elapsed >= JUMP_DURATION_MS) {
-        s.tumbling = false;
-        s.jumpScale = 1;
-        s.shadowAlpha = 0;
-      } else {
-        const t = elapsed / JUMP_DURATION_MS;
-        const heightFactor = Math.sin(t * Math.PI); // 0 -> 1 -> 0, a single hop arc
-        s.jumpScale = 1 + JUMP_SCALE_BOOST * heightFactor;
-        s.shadowAlpha = JUMP_SHADOW_ALPHA * heightFactor;
-        for (let i = 0; i < LEG_COUNT; i++) {
-          s.legPhases[i] += s.legSpeeds[i] * 1.6 + (Math.random() - 0.5) * 0.08;
+
+      if (s.airPhase === "out" && !headMoving) {
+        // head has stopped mid-flight — redirect straight to landing rather
+        // than finishing the scatter first
+        s.airPhase = "in";
+        assignNearestLandingTarget(s, px, py);
+      } else if (dist < REACH_RADIUS) {
+        if (s.airPhase === "out") {
+          // still moving — keep scattering to a fresh random point
+          assignScatterTarget(s);
+        } else {
+          // landed — resume normal crawling from here
+          s.airborne = false;
+          s.state = "roam";
         }
-        next.push(s);
-        continue;
       }
+
+      next.push(s);
+      continue;
     }
 
     // random-walk the pace: pulled gently back toward this spider's own
@@ -764,27 +825,28 @@ function updateSpiders(nowMs) {
     s.speedMult += (s.baseSpeedMult - s.speedMult) * SPEED_DRIFT_PULL + (Math.random() - 0.5) * SPEED_DRIFT_JITTER;
     s.speedMult = clamp(s.speedMult, SPEED_MULT_MIN, SPEED_MULT_MAX);
 
-    // released spiders (aftermath) have their own lifelong movement mode —
-    // they never eat, flee, or roam the face; they climb off it and loop the
-    // screen border forever
-    if (s.aftermathMode) {
+    // mouth is open, but each spider only joins the rush once it's held open
+    // longer than that spider's personal delay — a gradual drain, not a snap.
+    // This now applies even to released (aftermath-origin) spiders once a
+    // new "eating" round starts — they use the same drainDelay they were
+    // given when they first spawned, since it was never consumed the first
+    // time around (updateReleasedSpider skipped straight past it).
+    const shouldFlee = phase === "eating" && mouthIsOpen && nowMs - mouthOpenSince >= s.drainDelay;
+
+    // released spiders keep looping the border forever UNLESS this round is
+    // actively eating them back up
+    if (s.aftermathMode && !shouldFlee) {
       updateReleasedSpider(s);
       next.push(s);
       continue;
     }
-
-    // mouth is open, but each spider only joins the rush once it's held open
-    // longer than that spider's personal delay — a gradual drain, not a snap
-    // only the "eating" phase sucks spiders into the mouth — once we've
-    // flipped to "aftermath" an open mouth spawns new ones instead, and
-    // anything already crawling around should just keep roaming
-    const shouldFlee = phase === "eating" && mouthIsOpen && nowMs - mouthOpenSince >= s.drainDelay;
 
     let targetX, targetY, speed;
 
     if (shouldFlee) {
       // no burst of speed — it's purely a change of destination. Reaching the
       // mouth takes as long as it takes at this spider's normal crawling pace.
+      s.aftermathMode = false; // being swallowed again — no longer permanently released
       s.state = "fleeing";
       targetX = mouthCenter.x;
       targetY = mouthCenter.y;
@@ -876,20 +938,8 @@ const SPIDER_SIZE_FRACTION = 0.015; // fraction of the screen's shorter side —
 
 function drawSpider(s) {
   const pos = videoToCanvas(s.x, s.y);
-  const size = SPIDER_SIZE_FRACTION * Math.min(canvas.width, canvas.height) * (s.drawScale ?? s.scale) * (s.jumpScale ?? 1);
+  const size = SPIDER_SIZE_FRACTION * Math.min(canvas.width, canvas.height) * (s.drawScale ?? s.scale);
   if (size <= 0.1) return;
-
-  // faint ground shadow while mid-hop, marking where it'll land — drawn flat
-  // (not rotated with heading) and underneath the spider itself
-  if (s.shadowAlpha) {
-    ctx.save();
-    ctx.globalAlpha = s.shadowAlpha;
-    ctx.fillStyle = "#000";
-    ctx.beginPath();
-    ctx.ellipse(pos.x, pos.y, size * 0.55, size * 0.22, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
 
   const behindLens = lensZones.some((z) => Math.hypot(s.x - z.x, s.y - z.y) < z.r);
 
