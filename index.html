@@ -298,15 +298,20 @@ let currentLandmarks = null;
 let mouthCenter = { x: 0, y: 0 };
 let mouthOpenSince = null;
 
-// head-jolt / dislodge — see updateMouthState and triggerDislodge below
+// head-jolt / startle-jump — see updateMouthState and triggerDislodge below.
+// A fast head movement makes every settled spider hop in place: it briefly
+// scales up (reads as lifting off the surface) with a faint shadow marking
+// where it'll land, then settles back to normal size and resumes crawling.
 const HEAD_JOLT_THRESHOLD = 0.035; // fraction of face width moved in one frame to count as a jolt
-const TUMBLE_DURATION_MS = 900;
-const TUMBLE_SPIN_SPEED = 0.35; // radians per frame while tumbling — fast, deliberately disorienting
+const JUMP_DURATION_MS = 500;
+const JUMP_SCALE_BOOST = 0.2; // peak size increase, e.g. 0.2 = 20% bigger at the top of the hop
+const JUMP_SHADOW_ALPHA = 0.3; // peak shadow opacity
 let lastFaceCenter = null;
 
 function triggerDislodge(nowMs) {
   for (const s of spiders) {
     if (s.state !== "roam") continue; // only spiders actually settled on the face are affected
+    if (s.tumbling) continue; // already mid-hop — let it finish rather than restarting the arc
     s.tumbling = true;
     s.tumbleStart = nowMs + Math.random() * 150; // slight per-spider stagger, not a uniform mass-flinch
   }
@@ -726,21 +731,28 @@ function updateSpiders(nowMs) {
       continue;
     }
 
-    // dislodged by a fast head movement — spins in place rather than trying
-    // (and failing) to track the face live; lands back into normal roaming
-    // once TUMBLE_DURATION_MS has passed without a fresh jolt extending it
+    // dislodged by a fast head movement — a startle hop (scale up, faint
+    // ground shadow, settle back down) rather than trying, and failing, to
+    // track the face live
     if (s.tumbling) {
-      if (nowMs - s.tumbleStart >= TUMBLE_DURATION_MS) {
+      if (nowMs < s.tumbleStart) {
+        next.push(s); // staggered start — hasn't begun this frame yet
+        continue;
+      }
+      const elapsed = nowMs - s.tumbleStart;
+      if (elapsed >= JUMP_DURATION_MS) {
         s.tumbling = false;
-      } else if (nowMs >= s.tumbleStart) {
-        s.angle += TUMBLE_SPIN_SPEED;
+        s.jumpScale = 1;
+        s.shadowAlpha = 0;
+      } else {
+        const t = elapsed / JUMP_DURATION_MS;
+        const heightFactor = Math.sin(t * Math.PI); // 0 -> 1 -> 0, a single hop arc
+        s.jumpScale = 1 + JUMP_SCALE_BOOST * heightFactor;
+        s.shadowAlpha = JUMP_SHADOW_ALPHA * heightFactor;
         for (let i = 0; i < LEG_COUNT; i++) {
-          s.legPhases[i] += s.legSpeeds[i] * 2 + (Math.random() - 0.5) * 0.1;
+          s.legPhases[i] += s.legSpeeds[i] * 1.6 + (Math.random() - 0.5) * 0.08;
         }
         next.push(s);
-        continue;
-      } else {
-        next.push(s); // staggered start — hasn't begun spinning yet this frame
         continue;
       }
     }
@@ -864,8 +876,20 @@ const SPIDER_SIZE_FRACTION = 0.015; // fraction of the screen's shorter side —
 
 function drawSpider(s) {
   const pos = videoToCanvas(s.x, s.y);
-  const size = SPIDER_SIZE_FRACTION * Math.min(canvas.width, canvas.height) * (s.drawScale ?? s.scale);
+  const size = SPIDER_SIZE_FRACTION * Math.min(canvas.width, canvas.height) * (s.drawScale ?? s.scale) * (s.jumpScale ?? 1);
   if (size <= 0.1) return;
+
+  // faint ground shadow while mid-hop, marking where it'll land — drawn flat
+  // (not rotated with heading) and underneath the spider itself
+  if (s.shadowAlpha) {
+    ctx.save();
+    ctx.globalAlpha = s.shadowAlpha;
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.ellipse(pos.x, pos.y, size * 0.55, size * 0.22, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
 
   const behindLens = lensZones.some((z) => Math.hypot(s.x - z.x, s.y - z.y) < z.r);
 
