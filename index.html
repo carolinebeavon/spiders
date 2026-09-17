@@ -257,6 +257,7 @@ let openWideMessageVisible = false;
 
 const ROAM_SPEED = 0.16;
 const ENTER_SPEED = 0.3;
+const EMERGE_SPEED = 1.4; // fast initial burst away from the mouth on emergence, so new arrivals don't pile up on top of each other before dispersing
 const RETARGET_MIN_MS = 900;
 const RETARGET_MAX_MS = 2400;
 const REACH_RADIUS = 14;
@@ -619,8 +620,8 @@ function spawnSpider() {
 // updateReleasedSpider below) rather than the normal state machine.
 let aftermathSpawned = 0;
 function spawnFromMouth() {
-  const s = createSpider(mouthCenter.x, mouthCenter.y, 1, -Math.PI / 2);
-  s.state = "released";
+  const s = createSpider(mouthCenter.x, mouthCenter.y, 1, Math.random() * Math.PI * 2);
+  s.state = "emerging"; // bursts out to a random point across the face first — see updateReleasedSpider
   s.aftermathMode = true;
   aftermathSpawned++;
 }
@@ -694,7 +695,7 @@ function checkPhaseTransition(nowMs) {
 // is walked as a single scalar distance along the rectangle's perimeter
 // (starting at the top-left corner, increasing clockwise), which sidesteps
 // needing separate per-edge logic or explicit corner-turning code.
-function updateReleasedSpider(s) {
+function updateReleasedSpider(s, px, py) {
   const bounds = {
     left: coverRect.sx,
     right: coverRect.sx + coverRect.sw,
@@ -702,6 +703,30 @@ function updateReleasedSpider(s) {
     bottom: coverRect.sy + coverRect.sh,
   };
   const speed = ROAM_SPEED * s.speedMult;
+
+  // burst out from the mouth to a random point across the WHOLE face, fast —
+  // otherwise a rapid stream of emerging spiders just piles up near the
+  // mouth/nose, since each one alone dispersing at normal roam speed can't
+  // clear the area before the next one arrives
+  if (s.state === "emerging") {
+    const emergeSpeed = EMERGE_SPEED * s.speedMult;
+    const landmarkIdx = CRAWL_POINTS[s.targetIdx];
+    const targetX = px(landmarkIdx);
+    const targetY = py(landmarkIdx);
+    const dx = targetX - s.x;
+    const dy = targetY - s.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    s.angle = Math.atan2(dy, dx);
+    s.x += (dx / dist) * emergeSpeed;
+    s.y += (dy / dist) * emergeSpeed;
+    for (let i = 0; i < LEG_COUNT; i++) {
+      s.legPhases[i] += s.legSpeeds[i] * 1.8 + (Math.random() - 0.5) * 0.06;
+    }
+    if (dist < REACH_RADIUS) {
+      s.state = "released"; // now begin the climb to the top edge, as before
+    }
+    return;
+  }
 
   if (s.state === "released") {
     s.angle = -Math.PI / 2; // straight up
@@ -836,7 +861,7 @@ function updateSpiders(nowMs) {
     // released spiders keep looping the border forever UNLESS this round is
     // actively eating them back up
     if (s.aftermathMode && !shouldFlee) {
-      updateReleasedSpider(s);
+      updateReleasedSpider(s, px, py);
       next.push(s);
       continue;
     }
